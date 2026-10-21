@@ -63,8 +63,8 @@ jobs:
                   applicationId "com.local.nuviobridge"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "1.1"
               }
               buildTypes {
                   release {
@@ -124,20 +124,19 @@ jobs:
           cat << 'EOF' > app/src/main/res/xml/accessibility_service_config.xml
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeViewClicked|typeWindowStateChanged"
+              android:accessibilityEventTypes="typeViewClicked|typeViewSelected|typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
               android:canRetrieveWindowContent="true"
               android:notificationTimeout="100"
-              android:description="@string/accessibility_desc"
-              android:packageNames="com.google.android.tvlauncher,com.google.android.apps.tv.launcherx,com.spocky.projengmenu,com.google.android.katniss" />
+              android:description="@string/accessibility_desc" />
           EOF
 
           cat << 'EOF' > app/src/main/res/values/strings.xml
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">NuvioBridge</string>
-              <string name="accessibility_desc">Intercepts Android TV / Google TV / Projectivy home screen recommendation clicks and routes them directly into Nuvio and TizenTube/SmartTube.</string>
+              <string name="accessibility_desc">Routes Android TV launcher clicks into Nuvio and TizenTube/SmartTube.</string>
           </resources>
           EOF
 
@@ -152,7 +151,6 @@ jobs:
           import android.widget.Button
           import android.widget.EditText
           import android.widget.LinearLayout
-          import android.widget.Switch
           import android.widget.TextView
           import android.widget.Toast
 
@@ -171,27 +169,12 @@ jobs:
                       setTextColor(Color.WHITE)
                       setPadding(0, 0, 0, 16)
                   }
-                  val subTitle = TextView(this).apply {
-                      text = "Routes Launcher clicks -> Nuvio & TizenTube/SmartTube"
-                      textSize = 16f
-                      setTextColor(Color.LTGRAY)
-                      setPadding(0, 0, 0, 32)
-                  }
                   val apiKeyInput = EditText(this).apply {
-                      hint = "Enter free TMDB v3 API Key (themoviedb.org)"
+                      hint = "Enter TMDB v3 API Key"
                       setText(prefs.getString("tmdb_key", ""))
                       setTextColor(Color.WHITE)
                       setHintTextColor(Color.GRAY)
                       isSingleLine = true
-                  }
-                  val confirmToggle = Switch(this).apply {
-                      text = "Double-Click Confirmation Mode (Click once to arm, click again within 4s to open Nuvio)"
-                      setTextColor(Color.WHITE)
-                      isChecked = prefs.getBoolean("double_click_mode", false)
-                      setPadding(0, 24, 0, 24)
-                      setOnCheckedChangeListener { _, isChecked ->
-                          prefs.edit().putBoolean("double_click_mode", isChecked).apply()
-                      }
                   }
                   val saveBtn = Button(this).apply {
                       text = "1. Save TMDB API Key"
@@ -201,7 +184,7 @@ jobs:
                       }
                   }
                   val accessBtn = Button(this).apply {
-                      text = "2. Open Accessibility Settings (Enable NuvioBridge)"
+                      text = "2. Open Accessibility Settings (Enable Service)"
                       setOnClickListener {
                           try {
                               startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -211,9 +194,7 @@ jobs:
                       }
                   }
                   layout.addView(title)
-                  layout.addView(subTitle)
                   layout.addView(apiKeyInput)
-                  layout.addView(confirmToggle)
                   layout.addView(saveBtn)
                   layout.addView(accessBtn)
                   setContentView(layout)
@@ -242,107 +223,88 @@ jobs:
           class BridgeAccessibilityService : AccessibilityService() {
               private val executor = Executors.newSingleThreadExecutor()
               private val mainHandler = Handler(Looper.getMainLooper())
-              private var lastTriggeredTitle = ""
-              private var lastTriggerTime = 0L
-              private var armedTitle = ""
-              private var armedTime = 0L
+              private var lastTitle = ""
+              private var lastTime = 0L
 
               private val prefs by lazy { getSharedPreferences("bridge_prefs", MODE_PRIVATE) }
               private val tmdbApiKey: String get() = prefs.getString("tmdb_key", "") ?: ""
-              private val doubleClickMode: Boolean get() = prefs.getBoolean("double_click_mode", false)
 
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {
                   if (event == null) return
-                  if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
-                      val clickedNode = event.source ?: return
-                      val extractedText = extractTitleFromNode(clickedNode) ?: return
-                      if (isIgnoredSystemLabel(extractedText)) return
+                  val pkg = event.packageName?.toString() ?: ""
 
-                      val now = System.currentTimeMillis()
-                      if (doubleClickMode) {
-                          if (extractedText != armedTitle || (now - armedTime) > 4500) {
-                              armedTitle = extractedText
-                              armedTime = now
-                              showToast("Click '$extractedText' again within 4s to open in Nuvio")
+                  // Ignore our own app, settings, and internal system system-ui overlays
+                  if (pkg == packageName || pkg == "com.android.settings" || pkg == "com.android.systemui") return
+
+                  val node = event.source ?: rootInActiveWindow ?: return
+                  val title = findCandidateTitle(node) ?: return
+
+                  val now = System.currentTimeMillis()
+                  if (title == lastTitle && (now - lastTime) < 3500) return
+
+                  // Catch trigger when details window or card opens
+                  if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
+                      event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+
+                      // If we are on the details screen or launcher
+                      if (title.length > 1 && !isIgnoredWord(title)) {
+                          lastTitle = title
+                          lastTime = now
+
+                          if (tmdbApiKey.isBlank()) {
+                              showToast("Set TMDB Key in NuvioBridge app!")
                               return
                           }
-                          armedTitle = ""
-                      } else {
-                          if (extractedText == lastTriggeredTitle && (now - lastTriggerTime) < 3000) return
+
+                          showToast("Bridging '$title' -> Nuvio")
+                          performGlobalAction(GLOBAL_ACTION_BACK)
+                          resolveAndLaunch(title)
                       }
-
-                      lastTriggeredTitle = extractedText
-                      lastTriggerTime = now
-
-                      if (tmdbApiKey.isBlank()) {
-                          showToast("NuvioBridge: Please set your TMDB API key in the NuvioBridge app first!")
-                          return
-                      }
-
-                      if (extractedText.contains("Trailer", ignoreCase = true) ||
-                          extractedText.contains("YouTube", ignoreCase = true)) {
-                          val parentTitle = findParentMediaTitle(rootInActiveWindow)
-                          if (!parentTitle.isNullOrBlank()) {
-                              performGlobalAction(GLOBAL_ACTION_BACK)
-                              showToast("Opening Trailer in TizenTube/SmartTube: $parentTitle")
-                              resolveAndLaunchTrailer(parentTitle)
-                              return
-                          }
-                      }
-
-                      showToast("NuvioBridge -> $extractedText")
-                      performGlobalAction(GLOBAL_ACTION_BACK)
-                      resolveAndLaunchNuvio(extractedText)
                   }
               }
 
-              private fun extractTitleFromNode(node: AccessibilityNodeInfo?): String? {
+              private fun findCandidateTitle(node: AccessibilityNodeInfo?): String? {
                   if (node == null) return null
-                  node.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { return cleanTitle(it) }
-                  node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { return cleanTitle(it) }
+                  val text = node.text?.toString()?.trim()
+                  val desc = node.contentDescription?.toString()?.trim()
+
+                  val candidate = when {
+                      !desc.isNullOrEmpty() && desc.length > 2 && !isIgnoredWord(desc) -> clean(desc)
+                      !text.isNullOrEmpty() && text.length > 2 && !isIgnoredWord(text) -> clean(text)
+                      else -> null
+                  }
+
+                  if (candidate != null) return candidate
+
                   for (i in 0 until node.childCount) {
-                      val childTitle = extractTitleFromNode(node.getChild(i))
-                      if (!childTitle.isNullOrEmpty()) return childTitle
+                      val child = findCandidateTitle(node.getChild(i))
+                      if (child != null) return child
                   }
                   return null
               }
 
-              private fun cleanTitle(raw: String): String {
+              private fun clean(raw: String): String {
                   return raw.split("•", "\n", " - ", " | ", ", 20", ", 19").firstOrNull()?.trim() ?: raw
               }
 
-              private fun isIgnoredSystemLabel(label: String): Boolean {
+              private fun isIgnoredWord(w: String): Boolean {
                   val ignored = setOf(
                       "Home", "Search", "Apps", "Library", "Settings", "Profile",
-                      "Watchlist", "For you", "Movies", "Shows", "Live", "Continue watching",
-                      "See all", "More info", "Back", "Cancel", "OK"
+                      "Watchlist", "For you", "Movies", "Shows", "Live", "Play", "Watch",
+                      "Details", "Overview", "More info", "Trailer", "OK", "Cancel"
                   )
-                  return ignored.any { it.equals(label, ignoreCase = true) } || label.length < 2
+                  return ignored.any { it.equals(w, ignoreCase = true) }
               }
 
-              private fun findParentMediaTitle(root: AccessibilityNodeInfo?): String? {
-                  if (root == null) return null
-                  if (root.className?.contains("TextView") == true && !root.text.isNullOrBlank()) {
-                      val t = root.text.toString().trim()
-                      if (!isIgnoredSystemLabel(t) && !t.contains("Trailer", true)) return cleanTitle(t)
-                  }
-                  for (i in 0 until root.childCount) {
-                      findParentMediaTitle(root.getChild(i))?.let { return it }
-                  }
-                  return null
-              }
-
-              private fun resolveAndLaunchNuvio(rawQuery: String) {
+              private fun resolveAndLaunch(query: String) {
                   executor.execute {
                       try {
-                          val encoded = URLEncoder.encode(rawQuery, "UTF-8")
-                          val searchUrl = "https://api.themoviedb.org/3/search/multi?api_key=$tmdbApiKey&query=$encoded&include_adult=false"
-                          val searchJson = JSONObject(URL(searchUrl).readText())
-                          val results = searchJson.optJSONArray("results")
-                          if (results == null || results.length() == 0) {
-                              showToast("No TMDB match for '$rawQuery'")
-                              return@execute
-                          }
+                          val encoded = URLEncoder.encode(query, "UTF-8")
+                          val url = "https://api.themoviedb.org/3/search/multi?api_key=$tmdbApiKey&query=$encoded&include_adult=false"
+                          val json = JSONObject(URL(url).readText())
+                          val results = json.optJSONArray("results") ?: return@execute
+                          if (results.length() == 0) return@execute
+
                           var match: JSONObject? = null
                           for (i in 0 until results.length()) {
                               val item = results.getJSONObject(i)
@@ -353,89 +315,43 @@ jobs:
                               }
                           }
                           if (match == null) return@execute
-                          val tmdbId = match.getInt("id")
+
+                          val id = match.getInt("id")
                           val mediaType = match.getString("media_type")
                           val nuvioType = if (mediaType == "tv") "series" else "movie"
-                          val extUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId/external_ids?api_key=$tmdbApiKey"
+
+                          val extUrl = "https://api.themoviedb.org/3/$mediaType/$id/external_ids?api_key=$tmdbApiKey"
                           val extJson = JSONObject(URL(extUrl).readText())
                           val imdbId = extJson.optString("imdb_id", "")
-                          val targetId = if (imdbId.startsWith("tt")) imdbId else "tmdb:$tmdbId"
-                          mainHandler.post { launchInNuvio(nuvioType, targetId) }
+                          val targetId = if (imdbId.startsWith("tt")) imdbId else "tmdb:$id"
+
+                          mainHandler.post { launchNuvio(nuvioType, targetId) }
                       } catch (e: Exception) {
-                          Log.e("NuvioBridge", "Lookup failed", e)
-                          showToast("TMDB Lookup Error: ${e.localizedMessage}")
+                          Log.e("NuvioBridge", "Error", e)
                       }
                   }
               }
 
-              private fun launchInNuvio(type: String, id: String) {
-                  val nuvioPackages = listOf("com.nuvio.tv", "com.nuvio.tv.lite")
-                  val installedPkg = nuvioPackages.firstOrNull { isPackageInstalled(it) }
+              private fun launchNuvio(type: String, id: String) {
+                  val targets = listOf("com.nuvio.tv", "com.nuvio.tv.lite")
+                  val installed = targets.firstOrNull { isInstalled(it) }
+
                   val schemes = listOf("nuvio:///detail/$type/$id", "stremio:///detail/$type/$id")
-                  for (uriString in schemes) {
+                  for (uri in schemes) {
                       try {
-                          val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uriString)).apply {
+                          val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri)).apply {
                               addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                              if (installedPkg != null) setPackage(installedPkg)
+                              if (installed != null) setPackage(installed)
                           }
                           startActivity(intent)
                           return
                       } catch (_: Exception) {}
                   }
-                  showToast("Could not deep link into Nuvio. Make sure Nuvio is installed.")
               }
 
-              private fun resolveAndLaunchTrailer(title: String) {
-                  executor.execute {
-                      try {
-                          val encoded = URLEncoder.encode(title, "UTF-8")
-                          val searchUrl = "https://api.themoviedb.org/3/search/multi?api_key=$tmdbApiKey&query=$encoded"
-                          val results = JSONObject(URL(searchUrl).readText()).optJSONArray("results") ?: return@execute
-                          if (results.length() == 0) return@execute
-                          val first = results.getJSONObject(0)
-                          val id = first.getInt("id")
-                          val mediaType = first.optString("media_type", "movie")
-                          val videosUrl = "https://api.themoviedb.org/3/$mediaType/$id/videos?api_key=$tmdbApiKey"
-                          val videos = JSONObject(URL(videosUrl).readText()).optJSONArray("results") ?: return@execute
-                          var youtubeKey: String? = null
-                          for (i in 0 until videos.length()) {
-                              val v = videos.getJSONObject(i)
-                              if (v.optString("site") == "YouTube" && v.optString("type") == "Trailer") {
-                                  youtubeKey = v.optString("key")
-                                  break
-                              }
-                          }
-                          if (youtubeKey != null) {
-                              mainHandler.post { launchYouTubeVideo(youtubeKey) }
-                          }
-                      } catch (e: Exception) {
-                          Log.e("NuvioBridge", "Trailer lookup failed", e)
-                      }
-                  }
-              }
-
-              private fun launchYouTubeVideo(videoId: String) {
-                  val ytUrl = "https://www.youtube.com/watch?v=$videoId"
-                  val candidates = listOf(
-                      "io.gh.reisxd.tizentube.cobalt",
-                      "com.liskovsoft.smarttubetv.beta",
-                      "com.liskovsoft.smarttubetv"
-                  )
-                  val targetPkg = candidates.firstOrNull { isPackageInstalled(it) }
-                  try {
-                      val intent = Intent(Intent.ACTION_VIEW, Uri.parse(ytUrl)).apply {
-                          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                          if (targetPkg != null) setPackage(targetPkg)
-                      }
-                      startActivity(intent)
-                  } catch (e: Exception) {
-                      showToast("Failed to launch TizenTube / SmartTube")
-                  }
-              }
-
-              private fun isPackageInstalled(packageName: String): Boolean {
+              private fun isInstalled(pkg: String): Boolean {
                   return try {
-                      packageManager.getPackageInfo(packageName, 0)
+                      packageManager.getPackageInfo(pkg, 0)
                       true
                   } catch (_: PackageManager.NameNotFoundException) {
                       false
@@ -469,3 +385,4 @@ jobs:
         with:
           name: NuvioBridge-APK
           path: app/build/outputs/apk/release/*.apk
+          
